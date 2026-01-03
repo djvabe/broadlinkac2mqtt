@@ -24,7 +24,6 @@ func NewWebClient(logger *slog.Logger) app.WebClient {
 func (w *webClient) SendCommand(ctx context.Context, input *models.SendCommandInput) (*models.SendCommandReturn, error) {
     var (
         err      error
-        // conn törölve, mert nem használod sehol
         response []byte
     )
 
