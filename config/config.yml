@@ -20,10 +20,13 @@ mqtt:
   # key-client: "./config/cert/client.key"
 
 devices:
-  - ip: 192.168.1.12
-    mac: 34ea345b0fd4
-    name: MH Childroom AC
+  - ip: 192.168.66.11
+    mac: C8F742DFA4FA
+    name: Folyosó
     port: 80
-    # Temperature Unit defines the temperature unit of the device, C or F.
-    # If this is not set, the temperature unit is Celsius.
+    temperature_unit: C
+  - ip: 192.168.66.15
+    mac: 34EA34901881
+    name: Nappali
+    port: 80
     temperature_unit: C

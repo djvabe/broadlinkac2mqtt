@@ -297,7 +297,7 @@ func (s *service) GetDeviceAmbientTemperature(ctx context.Context, input *models
 
 	if readAmbientTempReturn != nil {
 		// Sometimes there is strange temperature
-		if readAmbientTempReturn.Temperature-ambientTemp > 4 || ambientTemp-readAmbientTempReturn.Temperature > 4 {
+		if readAmbientTempReturn.Temperature-ambientTemp > 4 || ambientTemp-readAmbientTempReturn.Temperature > 10 {
 			s.logger.ErrorContext(ctx, "failed to read the ambient temperature", slog.Any("input", readAmbientTempInput))
 			return models.ErrorInvalidParameterTemperature
 		}
@@ -1258,18 +1258,38 @@ func (s *service) StartDeviceMonitoring(ctx context.Context, input *models.Start
 		case <-ctx.Done():
 			return nil
 		default:
+			// Hőmérséklet lekérdezése (180 másodpercenként vagy hiba esetén retry)
 			if time.Now().Sub(lastGetAmbientTemp).Seconds() > 180 {
-				err := s.GetDeviceAmbientTemperature(ctx, &models.GetDeviceAmbientTemperatureInput{Mac: input.Mac})
+				maxRetries := 3
+				success := false
+
+				for i := 0; i < maxRetries; i++ {
+					err := s.GetDeviceAmbientTemperature(ctx, &models.GetDeviceAmbientTemperatureInput{Mac: input.Mac})
 					if err != nil {
-						s.logger.ErrorContext(ctx, "failed to get ambient temperature",
+						s.logger.WarnContext(ctx, "failed to get ambient temperature, retrying...",
+							slog.Int("attempt", i+1),
 							slog.Any("err", err),
 							slog.String("device", input.Mac))
 
-						err = nil
-						time.Sleep(time.Second * 2)
+						// Ha az utolsó retry is sikertelen, megpróbálunk egy re-auth-ot
+						if i == maxRetries-1 {
+							s.logger.InfoContext(ctx, "attempts exhausted, trying re-authentication", slog.String("device", input.Mac))
+							_ = s.AuthDevice(ctx, &models.AuthDeviceInput{Mac: input.Mac})
+						}
+
+						time.Sleep(time.Second * 3) // Várjunk kicsit a köv. próbálkozás előtt
 						continue
 					}
+					success = true
+					break
+				}
+
+				if !success {
+					s.logger.ErrorContext(ctx, "permanently failed to get ambient temperature after retries",
+						slog.String("device", input.Mac))
+				}
 				lastGetAmbientTemp = time.Now()
+
 			} else {
 				var (
 					forcedUpdateDeviceState  = false
@@ -1345,11 +1365,11 @@ func (s *service) StartDeviceMonitoring(ctx context.Context, input *models.Start
 									err = nil
 								}
 								isDeviceAvailable = false
-								}
-								err = nil
-								time.Sleep(time.Second * 2)
-								continue
-							} else {
+							}
+							err = nil
+							time.Sleep(time.Second * 2)
+							continue
+						} else {
 							lastGetDeviceState = time.Now()
 							if !isDeviceAvailable {
 								updateDeviceAvailabilityInput := &models.UpdateDeviceAvailabilityInput{
