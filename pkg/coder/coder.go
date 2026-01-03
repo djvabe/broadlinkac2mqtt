@@ -11,6 +11,14 @@ func Encrypt(key, iv, plaintext []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	for {
+		if len(plaintext)%block.BlockSize() != 0 {
+			plaintext = append(plaintext, byte(0))
+		} else {
+			break
+		}
+	}
+
 	ciphertext := make([]byte, len(plaintext))
 
 	mode := cipher.NewCBCEncrypter(block, iv)
