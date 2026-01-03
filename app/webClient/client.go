@@ -22,36 +22,46 @@ func NewWebClient(logger *slog.Logger) app.WebClient {
 }
 
 func (w *webClient) SendCommand(ctx context.Context, input *models.SendCommandInput) (*models.SendCommandReturn, error) {
-	conn, err := net.Dial("udp", input.Ip+":"+strconv.Itoa(int(input.Port)))
+	var (
+		err      error
+		conn     net.Conn
+		response []byte
+	)
+
+	for i := 0; i < 3; i++ {
+		response, err = w.sendCommand(ctx, input)
+		if err == nil {
+			return &models.SendCommandReturn{Payload: response}, nil
+		}
+		w.logger.WarnContext(ctx, "Failed to send command, retrying...", slog.Int("attempt", i+1), slog.Any("err", err))
+		time.Sleep(time.Second * 1)
+	}
+
+	return nil, err
+}
+
+func (w *webClient) sendCommand(ctx context.Context, input *models.SendCommandInput) ([]byte, error) {
+	conn, err := net.DialTimeout("udp", input.Ip+":"+strconv.Itoa(int(input.Port)), time.Second*5)
 	if err != nil {
-		w.logger.ErrorContext(ctx, "Failed to dial address", slog.Any("err", err))
 		return nil, err
 	}
-	defer func(conn net.Conn) {
-		err = conn.Close()
-		if err != nil {
-			w.logger.ErrorContext(ctx, "Failed to close client connection", slog.Any("err", err))
-		}
-	}(conn)
+	defer conn.Close()
 
-	err = conn.SetDeadline(time.Now().Add(time.Second * 10))
+	err = conn.SetDeadline(time.Now().Add(time.Second * 5))
 	if err != nil {
-		w.logger.ErrorContext(ctx, "Failed to set deadline", slog.Any("err", err))
 		return nil, err
 	}
 
 	_, err = conn.Write(input.Payload)
 	if err != nil {
-		w.logger.ErrorContext(ctx, "Failed to write the payload", slog.Any("err", err))
 		return nil, err
 	}
 
 	response := make([]byte, 1024)
-	_, err = conn.Read(response)
+	n, err := conn.Read(response)
 	if err != nil {
-		w.logger.ErrorContext(ctx, "Failed to read the response", slog.Any("err", err))
 		return nil, err
 	}
 
-	return &models.SendCommandReturn{Payload: response}, nil
+	return response[:n], nil
 }
