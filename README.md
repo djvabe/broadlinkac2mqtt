@@ -3,6 +3,13 @@ Control your broadlink-based air conditioner using Home Assistant
 
 ![Image](image.png)
 
+## Improvements & Stability Fixes
+This version includes significant reliability updates to ensure continuous 24/7 operation:
+
+* **Automatic Retry Mechanism:** Added logic to handle communication glitches. If the device returns an `ErrorInvalidResultPacket`, the service automatically retries the request instead of failing.
+* **Self-Healing Authentication:** If the connection is lost or the session expires, the service now automatically triggers a **re-authentication** process to restore control without manual restart.
+* **Sensor Data Fixes:** Resolved issues where ambient temperature reading would occasionally fail (`ErrorInvalidParameterTemperature`), providing a smoother data stream for Home Assistant.
+
 ## Advantages
 
 * Small application size (~10.2 Mb docker, ~8.2 Mb Windows Standalone)
