@@ -166,11 +166,17 @@ func (s *service) AuthDevice(ctx context.Context, input *models.AuthDeviceInput)
 		return err
 	}
 
+	// ELLENŐRZÉS: Ha a payload rövidebb, mint 20 bájt, ne próbáljuk meg szeletelni
+	if len(response.Payload) < 0x14 {
+		s.logger.ErrorContext(ctx, "decrypted payload too short for auth keys", slog.Int("len", len(response.Payload)))
+		return errors.New("decrypted payload too short")
+	}
+
 	auth = modelsRepo.DeviceAuth{
 		LastMessageId: auth.LastMessageId,
 		DevType:       auth.DevType,
 		Id:            [4]byte{response.Payload[0], response.Payload[1], response.Payload[2], response.Payload[3]},
-		Key:           response.Payload[0x04:0x14],
+		Key:           response.Payload[0x04:0x14], // Itt történt a pánik
 		Iv:            auth.Iv,
 	}
 
@@ -1253,170 +1259,125 @@ func (s *service) StartDeviceMonitoring(ctx context.Context, input *models.Start
 		isDeviceAvailable bool
 	)
 
+	const maxRetries = 3
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
-			// Hőmérséklet lekérdezése (180 másodpercenként vagy hiba esetén retry)
+			// 1. Hőmérséklet lekérdezése retry logikával
 			if time.Now().Sub(lastGetAmbientTemp).Seconds() > 180 {
-				maxRetries := 3
-				success := false
-
+				tempSuccess := false
 				for i := 0; i < maxRetries; i++ {
 					err := s.GetDeviceAmbientTemperature(ctx, &models.GetDeviceAmbientTemperatureInput{Mac: input.Mac})
-					if err != nil {
-						s.logger.WarnContext(ctx, "failed to get ambient temperature, retrying...",
-							slog.Int("attempt", i+1),
-							slog.Any("err", err),
-							slog.String("device", input.Mac))
-
-						// Ha az utolsó retry is sikertelen, megpróbálunk egy re-auth-ot
-						if i == maxRetries-1 {
-							s.logger.InfoContext(ctx, "attempts exhausted, trying re-authentication", slog.String("device", input.Mac))
-							_ = s.AuthDevice(ctx, &models.AuthDeviceInput{Mac: input.Mac})
-						}
-
-						time.Sleep(time.Second * 3) // Várjunk kicsit a köv. próbálkozás előtt
-						continue
+					if err == nil {
+						tempSuccess = true
+						break
 					}
-					success = true
-					break
+
+					s.logger.WarnContext(ctx, "failed to get ambient temperature, retrying...",
+						slog.Int("attempt", i+1),
+						slog.String("device", input.Mac),
+						slog.Any("err", err))
+
+					if i == maxRetries-1 {
+						s.logger.InfoContext(ctx, "attempts exhausted, trying re-authentication", slog.String("device", input.Mac))
+						_ = s.AuthDevice(ctx, &models.AuthDeviceInput{Mac: input.Mac})
+					}
+					time.Sleep(time.Second * 2)
 				}
 
-				if !success {
-					s.logger.ErrorContext(ctx, "permanently failed to get ambient temperature after retries",
-						slog.String("device", input.Mac))
+				if !tempSuccess {
+					s.logger.ErrorContext(ctx, "permanently failed to get ambient temperature in this cycle", slog.String("device", input.Mac))
 				}
 				lastGetAmbientTemp = time.Now()
+			}
 
-			} else {
-				var (
-					forcedUpdateDeviceState  = false
-					mode, swingMode, fanMode *string
-					temperature              *float32
-					isDisplayOn              *bool
-				)
+			// 2. MQTT üzenetek feldolgozása a cache-ből
+			var (
+				forcedUpdateDeviceState  = false
+				mode, swingMode, fanMode *string
+				temperature              *float32
+				isDisplayOn              *bool
+			)
 
-				readMqttMessageInput := &modelsRepo.ReadMqttMessageInput{
-					Mac: input.Mac,
-				}
-				message, err := s.cache.ReadMqttMessage(ctx, readMqttMessageInput)
-				if err != nil {
-					return err
-				}
+			readMqttMessageInput := &modelsRepo.ReadMqttMessageInput{Mac: input.Mac}
+			message, err := s.cache.ReadMqttMessage(ctx, readMqttMessageInput)
+			if err != nil {
+				s.logger.ErrorContext(ctx, "failed to read mqtt message from cache", slog.Any("err", err))
+				time.Sleep(time.Second * 1)
+				continue
+			}
 
-				if message.Mode != nil {
-					if message.Mode.UpdatedAt != modeUpdatedTime {
-						forcedUpdateDeviceState = true
-						mode = &message.Mode.Mode
-					}
-				}
+			// Változások figyelése
+			if message.Mode != nil && message.Mode.UpdatedAt != modeUpdatedTime {
+				forcedUpdateDeviceState = true
+				mode = &message.Mode.Mode
+			}
+			if message.FanMode != nil && message.FanMode.UpdatedAt != fanModeUpdatedTime {
+				forcedUpdateDeviceState = true
+				fanMode = &message.FanMode.FanMode
+			}
+			if message.SwingMode != nil && message.SwingMode.UpdatedAt != swingModeUpdatedTime {
+				forcedUpdateDeviceState = true
+				swingMode = &message.SwingMode.SwingMode
+			}
+			if message.Temperature != nil && message.Temperature.UpdatedAt != temperatureUpdatedTime {
+				forcedUpdateDeviceState = true
+				temperature = &message.Temperature.Temperature
+			}
+			if message.IsDisplayOn != nil && message.IsDisplayOn.UpdatedAt != isDisplayOnUpdatedTime {
+				forcedUpdateDeviceState = true
+				isDisplayOn = &message.IsDisplayOn.IsDisplayOn
+			}
 
-				if message.FanMode != nil {
-					if message.FanMode.UpdatedAt != fanModeUpdatedTime {
-						forcedUpdateDeviceState = true
-						fanMode = &message.FanMode.FanMode
-					}
-				}
-
-				if message.SwingMode != nil {
-					if message.SwingMode.UpdatedAt != swingModeUpdatedTime {
-						forcedUpdateDeviceState = true
-						swingMode = &message.SwingMode.SwingMode
-					}
-				}
-
-				if message.Temperature != nil {
-					if message.Temperature.UpdatedAt != temperatureUpdatedTime {
-						forcedUpdateDeviceState = true
-						temperature = &message.Temperature.Temperature
-					}
-				}
-
-				if message.IsDisplayOn != nil {
-					if message.IsDisplayOn.UpdatedAt != isDisplayOnUpdatedTime {
-						forcedUpdateDeviceState = true
-						isDisplayOn = &message.IsDisplayOn.IsDisplayOn
-					}
-				}
-
-				if forcedUpdateDeviceState || int(time.Now().Sub(lastGetDeviceState).Seconds()) > s.updateInterval {
-					for {
-						err = s.GetDeviceStates(ctx, &models.GetDeviceStatesInput{Mac: input.Mac})
-						if err != nil {
-							s.logger.ErrorContext(ctx, "failed to get AC States",
-								slog.Any("err", err),
-								slog.String("device", input.Mac))
-
-							// If we cannot receive data from the air conditioner within three intervals,
-							// then we send the status that the air conditioner is unavailable
-							if time.Now().Sub(lastGetDeviceState).Seconds() > float64(s.updateInterval)*3 && isDeviceAvailable {
-								updateDeviceAvailabilityInput := &models.UpdateDeviceAvailabilityInput{
-									Mac:          input.Mac,
-									Availability: models.StatusOffline,
-								}
-								err = s.UpdateDeviceAvailability(ctx, updateDeviceAvailabilityInput)
-								if err != nil {
-									s.logger.ErrorContext(ctx, "failed to update device availability",
-										slog.Any("err", err),
-										slog.String("device", input.Mac),
-										slog.Any("input", updateDeviceAvailabilityInput))
-									err = nil
-								}
-								isDeviceAvailable = false
-							}
-							err = nil
-							time.Sleep(time.Second * 2)
-							continue
-						} else {
-							lastGetDeviceState = time.Now()
-							if !isDeviceAvailable {
-								updateDeviceAvailabilityInput := &models.UpdateDeviceAvailabilityInput{
-									Mac:          input.Mac,
-									Availability: models.StatusOnline,
-								}
-								err = s.UpdateDeviceAvailability(ctx, updateDeviceAvailabilityInput)
-								if err != nil {
-									s.logger.ErrorContext(ctx, "failed to update device availability",
-										slog.Any("err", err),
-										slog.String("device", input.Mac),
-										slog.Any("input", updateDeviceAvailabilityInput))
-
-									err = nil
-								}
-								isDeviceAvailable = true
-							}
-							break
+			// 3. AC Állapot lekérdezése retry logikával
+			if forcedUpdateDeviceState || int(time.Now().Sub(lastGetDeviceState).Seconds()) > s.updateInterval {
+				stateSuccess := false
+				for i := 0; i < maxRetries; i++ {
+					err = s.GetDeviceStates(ctx, &models.GetDeviceStatesInput{Mac: input.Mac})
+					if err == nil {
+						stateSuccess = true
+						lastGetDeviceState = time.Now()
+						if !isDeviceAvailable {
+							_ = s.UpdateDeviceAvailability(ctx, &models.UpdateDeviceAvailabilityInput{Mac: input.Mac, Availability: models.StatusOnline})
+							isDeviceAvailable = true
 						}
+						break
 					}
+
+					s.logger.WarnContext(ctx, "failed to get AC States, retrying...", slog.Int("attempt", i+1), slog.Any("err", err))
+
+					if i == maxRetries-1 {
+						s.logger.InfoContext(ctx, "max retries for states reached, trying re-auth", slog.String("device", input.Mac))
+						_ = s.AuthDevice(ctx, &models.AuthDeviceInput{Mac: input.Mac})
+					}
+					time.Sleep(time.Second * 2)
 				}
 
-				if forcedUpdateDeviceState && isDeviceAvailable {
-					// A short pause before sending a new message to the air conditioner so that it does not hang
-					time.Sleep(time.Millisecond * 500)
-
-					updateDeviceStatesInput := &models.UpdateDeviceStatesInput{
-						Mac:         input.Mac,
-						FanMode:     fanMode,
-						SwingMode:   swingMode,
-						Mode:        mode,
-						Temperature: temperature,
-						IsDisplayOn: isDisplayOn,
+				if !stateSuccess {
+					// Offline állapot kezelése
+					if time.Now().Sub(lastGetDeviceState).Seconds() > float64(s.updateInterval)*3 && isDeviceAvailable {
+						s.logger.ErrorContext(ctx, "device seems offline, updating availability", slog.String("device", input.Mac))
+						_ = s.UpdateDeviceAvailability(ctx, &models.UpdateDeviceAvailabilityInput{Mac: input.Mac, Availability: models.StatusOffline})
+						isDeviceAvailable = false
 					}
-					err := s.UpdateDeviceStates(ctx, updateDeviceStatesInput)
-					if err != nil {
-						s.logger.ErrorContext(ctx, "failed to update device states",
-							slog.Any("err", err),
-							slog.String("device", input.Mac),
-							slog.Any("input", updateDeviceStatesInput))
-						err = nil
-						continue
-					}
+				}
+			}
 
-					// Reset the time of the last update to get fresh data from the air conditioner
-					lastGetDeviceState = time.UnixMicro(0)
-
+			// 4. Parancsok kiküldése az AC-nek, ha változás történt
+			if forcedUpdateDeviceState && isDeviceAvailable {
+				time.Sleep(time.Millisecond * 500)
+				updateInput := &models.UpdateDeviceStatesInput{
+					Mac: input.Mac, FanMode: fanMode, SwingMode: swingMode, Mode: mode, Temperature: temperature, IsDisplayOn: isDisplayOn,
+				}
+				err := s.UpdateDeviceStates(ctx, updateInput)
+				if err != nil {
+					s.logger.ErrorContext(ctx, "failed to update device states", slog.Any("err", err), slog.String("device", input.Mac))
+				} else {
+					lastGetDeviceState = time.UnixMicro(0) // Kényszerített frissítés a következő körben
+					// Frissítjük az időbélyegeket
 					if message.Mode != nil {
 						modeUpdatedTime = message.Mode.UpdatedAt
 					}
@@ -1433,9 +1394,10 @@ func (s *service) StartDeviceMonitoring(ctx context.Context, input *models.Start
 						isDisplayOnUpdatedTime = message.IsDisplayOn.UpdatedAt
 					}
 				}
-
-				time.Sleep(time.Millisecond * 500)
 			}
+
+			// CPU kímélése
+			time.Sleep(time.Millisecond * 500)
 		}
 	}
 }
