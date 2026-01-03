@@ -22,22 +22,22 @@ func NewWebClient(logger *slog.Logger) app.WebClient {
 }
 
 func (w *webClient) SendCommand(ctx context.Context, input *models.SendCommandInput) (*models.SendCommandReturn, error) {
-	var (
-		err      error
-		conn     net.Conn
-		response []byte
-	)
+    var (
+        err      error
+        // conn törölve, mert nem használod sehol
+        response []byte
+    )
 
-	for i := 0; i < 3; i++ {
-		response, err = w.sendCommand(ctx, input)
-		if err == nil {
-			return &models.SendCommandReturn{Payload: response}, nil
-		}
-		w.logger.WarnContext(ctx, "Failed to send command, retrying...", slog.Int("attempt", i+1), slog.Any("err", err))
-		time.Sleep(time.Second * 1)
-	}
+    for i := 0; i < 3; i++ {
+        response, err = w.sendCommand(ctx, input)
+        if err == nil {
+            return &models.SendCommandReturn{Payload: response}, nil
+        }
+        w.logger.WarnContext(ctx, "Failed to send command, retrying...", slog.Int("attempt", i+1), slog.Any("err", err))
+        time.Sleep(time.Second * 1)
+    }
 
-	return nil, err
+    return nil, err
 }
 
 func (w *webClient) sendCommand(ctx context.Context, input *models.SendCommandInput) ([]byte, error) {
